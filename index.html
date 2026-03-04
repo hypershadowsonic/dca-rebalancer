@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Contributory Rebalancer</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0a0f1a; color: #e2e8f0; font-family: 'Inter', -apple-system, sans-serif; }
+    input[type=number] { appearance: textfield; -moz-appearance: textfield; }
+    input[type=number]::-webkit-outer-spin-button,
+    input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    input:focus { outline: none; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script type="text/babel">
+    const { useState, useMemo, useCallback } = React;
+
+    const TARGET_ALLOCATION = [
+      { ticker: "VT", target: 25, label: "全球核心", ccy: "USD" },
+      { ticker: "EPI", target: 5, label: "印度", ccy: "USD" },
+      { ticker: "VHT", target: 10, label: "醫療防禦", ccy: "USD" },
+      { ticker: "SMH", target: 10, label: "半導體", ccy: "USD" },
+      { ticker: "ITA", target: 10, label: "國防航太", ccy: "USD" },
+      { ticker: "POWR", target: 5, label: "能源基建", ccy: "USD" },
+      { ticker: "0050", target: 5, label: "台灣", ccy: "TWD" },
+      { ticker: "GLDM", target: 10, label: "黃金", ccy: "USD" },
+      { ticker: "SGOV", target: 5, label: "短債", ccy: "USD" },
+      { ticker: "VGIT", target: 5, label: "中債", ccy: "USD" },
+      { ticker: "IBIT", target: 5, label: "BTC", ccy: "USD" },
+      { ticker: "GSOL", target: 5, label: "SOL", ccy: "USD" },
+    ];
+
+    const INITIAL_VALUES = {
+      VT: 0, EPI: 0, VHT: 0, SMH: 0, ITA: 0, POWR: 0,
+      "0050": 0, GLDM: 0, SGOV: 0, VGIT: 0, IBIT: 0, GSOL: 0,
+    };
+
+    function fmt(n, ccy) {
+      if (n === 0) return ccy === "TWD" ? "NT$0" : "$0";
+      const prefix = ccy === "TWD" ? "NT$" : "$";
+      return prefix + n.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+    }
+
+    function DeviationBar({ deviation, maxDev }) {
+      const cap = Math.max(maxDev, 1);
+      const width = Math.min(Math.abs(deviation) / cap * 100, 100);
+      const isOver = deviation > 0;
+      const color = Math.abs(deviation) > 3
+        ? (isOver ? "#ef4444" : "#f97316")
+        : Math.abs(deviation) > 1.5
+        ? (isOver ? "#fb923c" : "#fbbf24")
+        : "#4ade80";
+
+      return (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, width: 120 }}>
+          <div style={{ flex: 1, height: 6, background: "#1e293b", borderRadius: 3, position: "relative", overflow: "hidden" }}>
+            <div style={{
+              position: "absolute",
+              [isOver ? "left" : "right"]: "50%",
+              [isOver ? "right" : "left"]: (50 - width / 2) + "%",
+              top: 0, bottom: 0, background: color, borderRadius: 3, transition: "all 0.3s ease",
+            }} />
+            <div style={{ position: "absolute", left: "50%", top: -1, bottom: -1, width: 1, background: "#475569" }} />
+          </div>
+          <span style={{ fontSize: 11, fontFamily: "'JetBrains Mono', monospace", color, minWidth: 42, textAlign: "right" }}>
+            {deviation >= 0 ? "+" : ""}{deviation.toFixed(1)}%
+          </span>
+        </div>
+      );
+    }
+
+    function CcyBadge({ ccy }) {
+      const isTWD = ccy === "TWD";
+      return (
+        <span style={{
+          fontSize: 8, fontWeight: 600, letterSpacing: 0.5,
+          padding: "1px 4px", borderRadius: 3, marginLeft: 4,
+          background: isTWD ? "#422006" : "#0c1a2e",
+          color: isTWD ? "#fbbf24" : "#475569",
+          verticalAlign: "middle",
+        }}>
+          {ccy}
+        </span>
+      );
+    }
+
+    function App() {
+      const [holdings, setHoldings] = useState(INITIAL_VALUES);
+      const [budgetUSD, setBudgetUSD] = useState(500);
+      const [budgetTWD, setBudgetTWD] = useState(0);
+      const [fxRate, setFxRate] = useState(32.5);
+      const [excludeList, setExcludeList] = useState(new Set());
+      const [targets, setTargets] = useState(
+        Object.fromEntries(TARGET_ALLOCATION.map(t => [t.ticker, t.target]))
+      );
+      const [showSettings, setShowSettings] = useState(false);
+
+      const updateHolding = useCallback((ticker, val) => {
+        const parsed = val === "" ? 0 : parseFloat(val);
+        if (!isNaN(parsed)) setHoldings(h => ({ ...h, [ticker]: parsed }));
+      }, []);
+
+      const toggleExclude = useCallback((ticker) => {
+        setExcludeList(prev => {
+          const next = new Set(prev);
+          next.has(ticker) ? next.delete(ticker) : next.add(ticker);
+          return next;
+        });
+      }, []);
+
+      const analysis = useMemo(() => {
+        const rate = fxRate || 32.5;
+
+        const holdingsUSD = {};
+        TARGET_ALLOCATION.forEach(({ ticker, ccy }) => {
+          const raw = holdings[ticker] || 0;
+          holdingsUSD[ticker] = ccy === "TWD" ? raw / rate : raw;
+        });
+
+        const totalValueUSD = Object.values(holdingsUSD).reduce((s, v) => s + v, 0);
+        const totalBudgetUSD = budgetUSD + budgetTWD / rate;
+        const totalWithBudgetUSD = totalValueUSD + totalBudgetUSD;
+
+        const rows = TARGET_ALLOCATION.map(({ ticker, label, ccy }) => {
+          const target = targets[ticker];
+          const currentUSD = holdingsUSD[ticker];
+          const currentLocal = holdings[ticker] || 0;
+          const currentPct = totalValueUSD > 0 ? (currentUSD / totalValueUSD) * 100 : 0;
+          const deviation = currentPct - target;
+          const targetValueUSD = (totalWithBudgetUSD * target) / 100;
+          const gapUSD = targetValueUSD - currentUSD;
+          return { ticker, label, ccy, target, currentUSD, currentLocal, currentPct, deviation, gapUSD };
+        });
+
+        const eligibleUSD = rows.filter(r => !excludeList.has(r.ticker) && r.gapUSD > 0 && r.ccy === "USD");
+        const eligibleTWD = rows.filter(r => !excludeList.has(r.ticker) && r.gapUSD > 0 && r.ccy === "TWD");
+
+        const buyPlan = [];
+        let remainingTWD_asUSD = budgetTWD / rate;
+        let remainingUSD = budgetUSD;
+
+        for (const row of eligibleTWD) {
+          const amount = Math.min(row.gapUSD, remainingTWD_asUSD);
+          if (amount > 0.05) {
+            buyPlan.push({
+              ticker: row.ticker, label: row.label, ccy: "TWD",
+              amountUSD: amount, amountLocal: amount * rate, gapUSD: row.gapUSD,
+            });
+            remainingTWD_asUSD -= amount;
+          }
+        }
+
+        remainingUSD += remainingTWD_asUSD;
+
+        const totalGapUSD = eligibleUSD.reduce((s, r) => s + Math.max(r.gapUSD, 0), 0);
+        if (totalGapUSD > 0 && remainingUSD > 0) {
+          const scale = Math.min(1, remainingUSD / totalGapUSD);
+          for (const row of eligibleUSD.sort((a, b) => b.gapUSD - a.gapUSD)) {
+            const amount = row.gapUSD * scale;
+            if (amount > 0.05) {
+              buyPlan.push({
+                ticker: row.ticker, label: row.label, ccy: "USD",
+                amountUSD: amount, amountLocal: amount, gapUSD: row.gapUSD,
+              });
+              remainingUSD -= amount;
+            }
+          }
+        }
+
+        buyPlan.sort((a, b) => b.amountUSD - a.amountUSD);
+
+        const postHoldingsUSD = { ...holdingsUSD };
+        buyPlan.forEach(b => { postHoldingsUSD[b.ticker] += b.amountUSD; });
+        const postTotalUSD = Object.values(postHoldingsUSD).reduce((s, v) => s + v, 0);
+
+        const postRows = rows.map(r => {
+          const postVal = postHoldingsUSD[r.ticker];
+          const postPct = postTotalUSD > 0 ? (postVal / postTotalUSD) * 100 : 0;
+          return { ...r, postPct, postDev: postPct - r.target };
+        });
+
+        const maxDev = Math.max(...postRows.map(r => Math.abs(r.postDev)), 1);
+        const totalBought = buyPlan.reduce((s, b) => s + b.amountUSD, 0);
+        const overallRemainUSD = totalBudgetUSD - totalBought;
+
+        return {
+          rows: postRows, maxDev, buyPlan, totalValueUSD, totalWithBudgetUSD,
+          totalBudgetUSD, remainingUSD: overallRemainUSD, rate,
+        };
+      }, [holdings, budgetUSD, budgetTWD, fxRate, excludeList, targets]);
+
+      const totalTarget = Object.values(targets).reduce((s, v) => s + v, 0);
+      const targetValid = Math.abs(totalTarget - 100) < 0.01;
+
+      return (
+        <div style={{ minHeight: "100vh", padding: "24px 16px" }}>
+
+          {/* Header */}
+          <div style={{ maxWidth: 780, margin: "0 auto 24px" }}>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 4 }}>
+              <h1 style={{
+                fontSize: 20, fontWeight: 700, margin: 0,
+                background: "linear-gradient(135deg, #60a5fa, #34d399)",
+                WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
+              }}>
+                Contributory Rebalancer
+              </h1>
+              <span style={{ fontSize: 11, color: "#475569", fontFamily: "'JetBrains Mono', monospace" }}>v1.2</span>
+            </div>
+            <p style={{ fontSize: 12, color: "#64748b", margin: 0 }}>
+              輸入持倉市值（0050 用台幣，其餘美金）→ 設定預算 → 取得買入建議
+            </p>
+          </div>
+
+          <div style={{ maxWidth: 780, margin: "0 auto" }}>
+
+            {/* Budget Row */}
+            <div style={{ display: "flex", gap: 10, marginBottom: 20, flexWrap: "wrap" }}>
+              <div style={{ flex: "1 1 160px", background: "#111827", borderRadius: 10, padding: "12px 14px", border: "1px solid #1e293b" }}>
+                <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 5 }}>
+                  IBKR 預算 (USD)
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                  <span style={{ color: "#475569", fontSize: 16 }}>$</span>
+                  <input type="number" value={budgetUSD}
+                    onChange={e => setBudgetUSD(Math.max(0, parseFloat(e.target.value) || 0))}
+                    style={{
+                      background: "transparent", border: "none",
+                      color: "#34d399", fontSize: 22, fontWeight: 700, width: 100,
+                      fontFamily: "'JetBrains Mono', monospace",
+                    }}
+                  />
+                </div>
+              </div>
+              <div style={{ flex: "1 1 160px", background: "#111827", borderRadius: 10, padding: "12px 14px", border: "1px solid #1e293b" }}>
+                <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 5 }}>
+                  台灣券商預算 (TWD)
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                  <span style={{ color: "#475569", fontSize: 14 }}>NT$</span>
+                  <input type="number" value={budgetTWD}
+                    onChange={e => setBudgetTWD(Math.max(0, parseFloat(e.target.value) || 0))}
+                    style={{
+                      background: "transparent", border: "none",
+                      color: "#fbbf24", fontSize: 22, fontWeight: 700, width: 100,
+                      fontFamily: "'JetBrains Mono', monospace",
+                    }}
+                  />
+                </div>
+              </div>
+              <div style={{ flex: "0 1 130px", background: "#111827", borderRadius: 10, padding: "12px 14px", border: "1px solid #1e293b" }}>
+                <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 5 }}>
+                  USD/TWD 匯率
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                  <span style={{ color: "#475569", fontSize: 14 }}>1:</span>
+                  <input type="number" value={fxRate} step="0.1"
+                    onChange={e => setFxRate(parseFloat(e.target.value) || 32.5)}
+                    style={{
+                      background: "transparent", border: "none",
+                      color: "#94a3b8", fontSize: 22, fontWeight: 700, width: 56,
+                      fontFamily: "'JetBrains Mono', monospace",
+                    }}
+                  />
+                </div>
+              </div>
+              <div style={{ flex: "1 1 140px", background: "#111827", borderRadius: 10, padding: "12px 14px", border: "1px solid #1e293b" }}>
+                <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", letterSpacing: 1, marginBottom: 5 }}>
+                  全組合 (USD equiv)
+                </div>
+                <div style={{
+                  fontSize: 22, fontWeight: 700, color: "#e2e8f0",
+                  fontFamily: "'JetBrains Mono', monospace",
+                }}>
+                  {fmt(analysis.totalValueUSD, "USD")}
+                </div>
+              </div>
+            </div>
+
+            {/* Settings toggle */}
+            <div style={{ marginBottom: 12 }}>
+              <button onClick={() => setShowSettings(!showSettings)} style={{
+                background: "transparent", border: "1px solid #1e293b", borderRadius: 6,
+                color: "#64748b", fontSize: 11, padding: "4px 10px", cursor: "pointer",
+              }}>
+                {showSettings ? "▾ 收起設定" : "▸ 目標比例設定"}
+                {!targetValid && <span style={{ color: "#ef4444", marginLeft: 6 }}>(合計 {totalTarget.toFixed(1)}%)</span>}
+              </button>
+            </div>
+
+            {showSettings && (
+              <div style={{
+                background: "#111827", borderRadius: 10, padding: 16,
+                border: "1px solid #1e293b", marginBottom: 20,
+              }}>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {TARGET_ALLOCATION.map(({ ticker }) => (
+                    <div key={ticker} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <span style={{ fontSize: 12, color: "#94a3b8", minWidth: 40 }}>{ticker}</span>
+                      <input type="number" value={targets[ticker]}
+                        onChange={e => setTargets(t => ({ ...t, [ticker]: parseFloat(e.target.value) || 0 }))}
+                        style={{
+                          width: 48, background: "#0a0f1a", border: "1px solid #1e293b",
+                          borderRadius: 4, color: "#e2e8f0", padding: "2px 6px", fontSize: 12,
+                          fontFamily: "'JetBrains Mono', monospace", textAlign: "right",
+                        }}
+                      />
+                      <span style={{ fontSize: 11, color: "#475569" }}>%</span>
+                    </div>
+                  ))}
+                </div>
+                <div style={{
+                  marginTop: 8, fontSize: 11, fontFamily: "'JetBrains Mono', monospace",
+                  color: targetValid ? "#4ade80" : "#ef4444",
+                }}>
+                  合計: {totalTarget.toFixed(1)}% {targetValid ? "✓" : "≠ 100%"}
+                </div>
+              </div>
+            )}
+
+            {/* Main Table */}
+            <div style={{ background: "#111827", borderRadius: 12, overflow: "hidden", border: "1px solid #1e293b" }}>
+              <div style={{
+                display: "grid",
+                gridTemplateColumns: "72px 48px 1fr 54px 54px 124px 32px",
+                padding: "10px 14px", background: "#0f172a", borderBottom: "1px solid #1e293b",
+                fontSize: 9, color: "#475569", textTransform: "uppercase", letterSpacing: 0.8,
+                alignItems: "center",
+              }}>
+                <span>標的</span>
+                <span style={{ textAlign: "right" }}>目標</span>
+                <span style={{ textAlign: "right", paddingRight: 8 }}>市值</span>
+                <span style={{ textAlign: "right" }}>現%</span>
+                <span style={{ textAlign: "right" }}>後%</span>
+                <span style={{ textAlign: "center" }}>偏差（買入後）</span>
+                <span style={{ textAlign: "center" }}>略</span>
+              </div>
+
+              {analysis.rows.map((row, i) => {
+                const excluded = excludeList.has(row.ticker);
+                return (
+                  <div key={row.ticker} style={{
+                    display: "grid",
+                    gridTemplateColumns: "72px 48px 1fr 54px 54px 124px 32px",
+                    padding: "7px 14px", alignItems: "center",
+                    borderBottom: i < analysis.rows.length - 1 ? "1px solid rgba(30,41,59,0.13)" : "none",
+                    background: excluded ? "#0a0f1a" : "transparent",
+                    opacity: excluded ? 0.45 : 1, transition: "all 0.2s",
+                  }}>
+                    <div>
+                      <div style={{ display: "flex", alignItems: "center" }}>
+                        <span style={{
+                          fontSize: 13, fontWeight: 600,
+                          fontFamily: "'JetBrains Mono', monospace",
+                          color: excluded ? "#475569" : "#e2e8f0",
+                        }}>{row.ticker}</span>
+                        <CcyBadge ccy={row.ccy} />
+                      </div>
+                      <div style={{ fontSize: 9, color: "#475569", marginTop: 1 }}>{row.label}</div>
+                    </div>
+
+                    <div style={{
+                      fontSize: 12, textAlign: "right", color: "#64748b",
+                      fontFamily: "'JetBrains Mono', monospace",
+                    }}>{row.target}%</div>
+
+                    <div style={{ textAlign: "right", paddingRight: 8 }}>
+                      <div style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
+                        <span style={{ color: "#334155", fontSize: 11 }}>
+                          {row.ccy === "TWD" ? "NT$" : "$"}
+                        </span>
+                        <input type="number" value={holdings[row.ticker] || ""}
+                          placeholder="0"
+                          onChange={e => updateHolding(row.ticker, e.target.value)}
+                          style={{
+                            width: 76, background: "#0a0f1a", border: "1px solid #1e293b",
+                            borderRadius: 4, padding: "3px 5px", textAlign: "right",
+                            color: row.ccy === "TWD" ? "#fbbf24" : "#e2e8f0",
+                            fontSize: 13,
+                            fontFamily: "'JetBrains Mono', monospace",
+                          }}
+                          onFocus={e => e.target.style.borderColor = "#334155"}
+                          onBlur={e => e.target.style.borderColor = "#1e293b"}
+                        />
+                      </div>
+                    </div>
+
+                    <div style={{
+                      fontSize: 11, textAlign: "right", color: "#94a3b8",
+                      fontFamily: "'JetBrains Mono', monospace",
+                    }}>{row.currentPct.toFixed(1)}%</div>
+
+                    <div style={{
+                      fontSize: 11, textAlign: "right",
+                      fontFamily: "'JetBrains Mono', monospace",
+                      color: Math.abs(row.postDev) < 1 ? "#4ade80" : "#94a3b8",
+                    }}>{row.postPct.toFixed(1)}%</div>
+
+                    <div style={{ display: "flex", justifyContent: "center" }}>
+                      <DeviationBar deviation={row.postDev} maxDev={analysis.maxDev} />
+                    </div>
+
+                    <div style={{ textAlign: "center" }}>
+                      <input type="checkbox" checked={excluded}
+                        onChange={() => toggleExclude(row.ticker)}
+                        style={{ cursor: "pointer", accentColor: "#475569", width: 13, height: 13 }}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Buy Plan */}
+            <div style={{
+              marginTop: 20, background: "#111827", borderRadius: 12,
+              border: "1px solid #1e293b", overflow: "hidden",
+            }}>
+              <div style={{
+                padding: "12px 16px", background: "#0f172a",
+                borderBottom: "1px solid #1e293b",
+                display: "flex", justifyContent: "space-between", alignItems: "center",
+              }}>
+                <span style={{ fontSize: 13, fontWeight: 600 }}>本月買入建議</span>
+                <div style={{ display: "flex", gap: 12, fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>
+                  {budgetUSD > 0 && <span style={{ color: "#34d399" }}>{fmt(budgetUSD, "USD")}</span>}
+                  {budgetTWD > 0 && <span style={{ color: "#fbbf24" }}>{fmt(budgetTWD, "TWD")}</span>}
+                </div>
+              </div>
+
+              {analysis.buyPlan.length === 0 ? (
+                <div style={{ padding: 20, textAlign: "center", color: "#475569", fontSize: 13 }}>
+                  {analysis.totalValueUSD === 0
+                    ? "請輸入持倉市值"
+                    : budgetUSD + budgetTWD === 0
+                    ? "請設定本月預算"
+                    : "所有持倉均已達標或超配，本月無需買入"}
+                </div>
+              ) : (
+                <div style={{ padding: "6px 0" }}>
+                  {analysis.buyPlan.map((b, i) => {
+                    const totalBought = analysis.buyPlan.reduce((s, x) => s + x.amountUSD, 0);
+                    const pctOfTotal = totalBought > 0 ? (b.amountUSD / totalBought) * 100 : 0;
+                    const isTWD = b.ccy === "TWD";
+                    return (
+                      <div key={b.ticker} style={{
+                        display: "flex", alignItems: "center", padding: "9px 16px",
+                        borderBottom: i < analysis.buyPlan.length - 1 ? "1px solid rgba(30,41,59,0.13)" : "none",
+                        gap: 10,
+                      }}>
+                        <div style={{
+                          width: 22, height: 22, borderRadius: 6,
+                          background: i === 0 ? "#1e3a5f" : i === 1 ? "#1e293b" : "#151c2b",
+                          display: "flex", alignItems: "center", justifyContent: "center",
+                          fontSize: 11, fontWeight: 600,
+                          color: i === 0 ? "#60a5fa" : "#475569", flexShrink: 0,
+                        }}>{i + 1}</div>
+
+                        <div style={{ minWidth: 80 }}>
+                          <span style={{
+                            fontFamily: "'JetBrains Mono', monospace",
+                            fontWeight: 600, fontSize: 14, color: "#e2e8f0",
+                          }}>{b.ticker}</span>
+                          <CcyBadge ccy={b.ccy} />
+                          <span style={{ fontSize: 10, color: "#475569", marginLeft: 6 }}>{b.label}</span>
+                        </div>
+
+                        <div style={{ flex: 1, height: 8, background: "#0a0f1a", borderRadius: 4, overflow: "hidden" }}>
+                          <div style={{
+                            width: pctOfTotal + "%", height: "100%",
+                            background: isTWD
+                              ? "linear-gradient(90deg, #422006, #fbbf24)"
+                              : "linear-gradient(90deg, #1e3a5f, " + (i === 0 ? "#3b82f6" : i === 1 ? "#60a5fa" : "#93c5fd") + ")",
+                            borderRadius: 4, transition: "width 0.3s",
+                          }} />
+                        </div>
+
+                        <div style={{
+                          fontFamily: "'JetBrains Mono', monospace",
+                          fontSize: 15, fontWeight: 600,
+                          color: isTWD ? "#fbbf24" : "#34d399",
+                          minWidth: 80, textAlign: "right",
+                        }}>
+                          {fmt(parseFloat(b.amountLocal.toFixed(1)), b.ccy)}
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  <div style={{
+                    padding: "10px 16px", borderTop: "1px solid #1e293b", marginTop: 4,
+                    display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8,
+                  }}>
+                    <span style={{ fontSize: 12, color: "#64748b" }}>買入合計</span>
+                    <div style={{ display: "flex", gap: 12, fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}>
+                      {(() => {
+                        const usdTotal = analysis.buyPlan.filter(b => b.ccy === "USD").reduce((s, b) => s + b.amountLocal, 0);
+                        const twdTotal = analysis.buyPlan.filter(b => b.ccy === "TWD").reduce((s, b) => s + b.amountLocal, 0);
+                        return (
+                          <>
+                            {usdTotal > 0 && <span style={{ color: "#34d399", fontWeight: 600 }}>
+                              {fmt(parseFloat(usdTotal.toFixed(1)), "USD")}
+                            </span>}
+                            {twdTotal > 0 && <span style={{ color: "#fbbf24", fontWeight: 600 }}>
+                              {fmt(parseFloat(twdTotal.toFixed(1)), "TWD")}
+                            </span>}
+                            {analysis.remainingUSD > 0.05 && (
+                              <span style={{ color: "#475569" }}>
+                                餘 {fmt(parseFloat(analysis.remainingUSD.toFixed(1)), "USD")}
+                              </span>
+                            )}
+                          </>
+                        );
+                      })()}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div style={{
+              marginTop: 16, padding: "0 4px",
+              fontSize: 10, color: "#334155", lineHeight: 1.7,
+            }}>
+              0050 以台幣輸入，透過匯率換算 USD 等值後統一計算比例。買入建議以原幣別顯示。TWD 預算優先分配給台幣標的，餘額自動併入 USD 資金池。
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
