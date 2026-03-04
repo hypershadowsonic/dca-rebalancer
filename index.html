@@ -123,6 +123,7 @@
       // Drive state
       const [driveStatus, setDriveStatus] = useState("idle"); // idle|syncing|synced|error
       const [accessToken,  setAccessToken]  = useState(null);
+      const [authError,    setAuthError]    = useState(null);
       const driveFileIdRef  = useRef(null); // avoid stale closure in debounced save
       const tokenClientRef  = useRef(null);
       const saveTimerRef    = useRef(null);
@@ -221,10 +222,15 @@
         const init = () => {
           if (!window.google?.accounts?.oauth2) return false;
           tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
-            client_id: GOOGLE_CLIENT_ID,
+            client_id: GOOGLE_CLIENT_ID.trim(),
             scope: DRIVE_SCOPE,
             callback: (resp) => {
-              if (resp.error) { setDriveStatus("error"); return; }
+              if (resp.error) {
+                setAuthError(resp.error_description || resp.error);
+                setDriveStatus("error");
+                return;
+              }
+              setAuthError(null);
               setAccessToken(resp.access_token);
               loadFromDrive(resp.access_token);
             },
@@ -403,22 +409,29 @@
                 <span style={{ fontSize: 11, color: "#475569", fontFamily: "'JetBrains Mono', monospace" }}>v1.3</span>
               </div>
               {/* Drive button */}
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                {syncBadge && (
-                  <span style={{ fontSize: 11, color: syncBadge.color, fontFamily: "'JetBrains Mono', monospace" }}>
-                    {syncBadge.text}
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  {syncBadge && (
+                    <span style={{ fontSize: 11, color: syncBadge.color, fontFamily: "'JetBrains Mono', monospace" }}>
+                      {syncBadge.text}
+                    </span>
+                  )}
+                  {accessToken ? (
+                    <button onClick={handleSignOut} style={{
+                      background: "transparent", border: "1px solid #1e293b", borderRadius: 6,
+                      color: "#64748b", fontSize: 11, padding: "4px 10px", cursor: "pointer",
+                    }}>登出 Drive</button>
+                  ) : (
+                    <button onClick={handleSignIn} style={{
+                      background: "transparent", border: "1px solid #334155", borderRadius: 6,
+                      color: "#60a5fa", fontSize: 11, padding: "4px 10px", cursor: "pointer",
+                    }}>連結 Google Drive</button>
+                  )}
+                </div>
+                {authError && !accessToken && (
+                  <span style={{ fontSize: 10, color: "#ef4444", fontFamily: "'JetBrains Mono', monospace", maxWidth: 240, textAlign: "right" }}>
+                    授權失敗: {authError}
                   </span>
-                )}
-                {accessToken ? (
-                  <button onClick={handleSignOut} style={{
-                    background: "transparent", border: "1px solid #1e293b", borderRadius: 6,
-                    color: "#64748b", fontSize: 11, padding: "4px 10px", cursor: "pointer",
-                  }}>登出 Drive</button>
-                ) : (
-                  <button onClick={handleSignIn} style={{
-                    background: "transparent", border: "1px solid #334155", borderRadius: 6,
-                    color: "#60a5fa", fontSize: 11, padding: "4px 10px", cursor: "pointer",
-                  }}>連結 Google Drive</button>
                 )}
               </div>
             </div>
