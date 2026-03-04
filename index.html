@@ -326,7 +326,8 @@
             )}
 
             {/* Main Table */}
-            <div style={{ background: "#111827", borderRadius: 12, overflow: "hidden", border: "1px solid #1e293b" }}>
+            <div style={{ borderRadius: 12, border: "1px solid #1e293b", overflowX: "auto", WebkitOverflowScrolling: "touch" }}>
+            <div style={{ background: "#111827", minWidth: 500 }}>
               <div style={{
                 display: "grid",
                 gridTemplateColumns: "72px 48px 1fr 54px 54px 124px 32px",
@@ -416,6 +417,7 @@
                   </div>
                 );
               })}
+            </div>
             </div>
 
             {/* Buy Plan */}
